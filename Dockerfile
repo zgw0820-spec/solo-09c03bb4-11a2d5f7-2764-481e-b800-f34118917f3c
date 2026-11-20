@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
-# GCC toolchain (libc6-dev provides the system headers).
+# GCC toolchain (libc6-dev provides the system headers) and binutils
+# (readelf/objcopy/strip for the split-symbols mode).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && apt-get install -y --no-install-recommends gcc libc6-dev binutils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
@@ -18,6 +19,8 @@ RUN useradd --create-home appuser \
 USER appuser
 
 ENV CACHE_DIR=/cache/objects \
+    DEBUG_CACHE_DIR=/cache/objects-debug \
+    SYMBOLS_DIR=/cache/symbols \
     WORK_DIR=/tmp/cbuild-work \
     PYTHONUNBUFFERED=1
 

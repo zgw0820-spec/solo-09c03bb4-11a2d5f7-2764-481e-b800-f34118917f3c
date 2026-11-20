@@ -6,9 +6,11 @@ services:
       - "8000:8000"
     environment:
       CACHE_DIR: /cache/objects
+      DEBUG_CACHE_DIR: /cache/objects-debug
+      SYMBOLS_DIR: /cache/symbols
       WORK_DIR: /tmp/cbuild-work
     volumes:
-      # Object cache survives container restarts.
+      # Object caches and the Build-ID symbol store survive container restarts.
       - cbuild-cache:/cache
     restart: unless-stopped
 

@@ -4,16 +4,21 @@ Usage: python tests/e2e_test.py [base_url]   (default http://127.0.0.1:8000)
 
 Covers: basic build, cache reuse on identical resubmission, header-change
 invalidation, same-name header shadowing, concurrent identical builds
-(singleflight), compile/link failure diagnostics, and path validation.
+(singleflight), compile/link failure diagnostics, path validation, and the
+split-symbols mode (Build ID stability, symbol download, debug-cache
+separation, whole-project keying, concurrent symbol publishing).
 """
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import httpx
 
@@ -39,8 +44,10 @@ def run_exe(data: bytes) -> str:
         os.unlink(path)
 
 
-def post_build(client: httpx.Client, files: dict[str, str], output: str = "app") -> httpx.Response:
-    payload = {"output": output, "files": [{"path": p, "content": c} for p, c in files.items()]}
+def post_build(client: httpx.Client, files: dict[str, str], output: str = "app",
+               split_symbols: bool = False) -> httpx.Response:
+    payload = {"output": output, "split_symbols": split_symbols,
+               "files": [{"path": p, "content": c} for p, c in files.items()]}
     return client.post("/build", json=payload, timeout=60)
 
 
@@ -48,6 +55,11 @@ def counts(resp: httpx.Response) -> tuple[int, int, int]:
     return (int(resp.headers["X-Compiled-Count"]),
             int(resp.headers["X-Reused-Count"]),
             int(resp.headers["X-Unit-Count"]))
+
+
+def readelf(args: list[str], path: str) -> str:
+    return subprocess.run(["readelf", *args, path], capture_output=True,
+                          text=True, timeout=30).stdout
 
 
 # ---------------------------------------------------------------- project P1
@@ -214,7 +226,130 @@ def main() -> int:
     r = post_build(client, {"readme.txt": "hello\n"})
     check("non-C file rejected", r.status_code == 400)
 
+    # ---------------------------------------------------------------- project P4 (split symbols)
+    nonce4 = os.urandom(8).hex()
+    P4 = {
+        "main.c": (
+            f"/* {nonce4} */\n"
+            "#include <stdio.h>\n#include \"calc.h\"\n"
+            "int main(void){ printf(\"calc=%d\\n\", calc_sum(20, 22)); return 0; }\n"
+        ),
+        "calc.c": f"/* {nonce4} */\n#include \"calc.h\"\nint calc_sum(int a, int b){{ return a + b; }}\n",
+        "calc.h": f"/* {nonce4} */\n#ifndef CALC_H\n#define CALC_H\nint calc_sum(int a, int b);\n#endif\n",
+    }
+    have_readelf = shutil.which("readelf") is not None
+
+    # 10. split-symbols build: Build ID header, symbols stored, program stripped
+    r = post_build(client, P4, split_symbols=True)
+    check("P4 split-symbols build -> 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:200]}")
+    bid = r.headers.get("X-Build-Id", "")
+    check("X-Build-Id is a 40-hex sha1", bool(re.fullmatch(r"[0-9a-f]{40}", bid)), bid)
+    check("X-Symbols-Status == stored", r.headers.get("X-Symbols-Status") == "stored",
+          r.headers.get("X-Symbols-Status"))
+    c, u, n = counts(r)
+    check("P4 split build compiled both units (debug cache separate)",
+          (c, u, n) == (2, 0, 2), f"compiled={c} reused={u} units={n}")
+    check("P4 stripped program runs", run_exe(r.content) == "calc=42")
+    if have_readelf:
+        exe_path = Path(tmpdir) / "p4-stripped"
+        exe_path.write_bytes(r.content)
+        notes = readelf(["-n"], str(exe_path))
+        check("stripped program keeps its Build ID note", f"Build ID: {bid}" in notes)
+        sections = readelf(["-S"], str(exe_path))
+        check("stripped program has no .debug sections", ".debug" not in sections)
+
+    # 11. identical split resubmission: same Build ID, symbols reused
+    r = post_build(client, P4, split_symbols=True)
+    check("P4 split resubmission: same Build ID (temp dir does not leak)",
+          r.status_code == 200 and r.headers.get("X-Build-Id") == bid,
+          r.headers.get("X-Build-Id", ""))
+    c, u, _ = counts(r)
+    check("P4 split resubmission fully reused from debug cache", (c, u) == (0, 2),
+          f"compiled={c} reused={u}")
+    check("P4 split resubmission: symbols reused",
+          r.headers.get("X-Symbols-Status") == "reused",
+          r.headers.get("X-Symbols-Status"))
+
+    # 12. symbol download by Build ID
+    r = client.get(f"/symbols/{bid}", timeout=10)
+    check("GET /symbols/{build_id} -> 200", r.status_code == 200,
+          f"got {r.status_code}")
+    sym = r.content
+    check("symbols reference repo-relative source paths",
+          b"/project/main.c" in sym and b"/project/calc.c" in sym)
+    check("symbols contain no build temp dir paths",
+          b"/tmp/" not in sym and b"/build-" not in sym)
+    if have_readelf:
+        sym_path = Path(tmpdir) / "p4.debug"
+        sym_path.write_bytes(sym)
+        check("symbol file carries the same Build ID",
+              f"Build ID: {bid}" in readelf(["-n"], str(sym_path)))
+        check("symbol file holds .debug_info",
+              ".debug_info" in readelf(["-S"], str(sym_path)))
+    r = client.get("/symbols", timeout=10)
+    check("GET /symbols lists the Build ID",
+          r.status_code == 200 and bid in r.json().get("build_ids", []))
+    r = client.get(f"/symbols/{'0' * 40}", timeout=10)
+    check("unknown Build ID -> 404", r.status_code == 404)
+    r = client.get("/symbols/nothex!", timeout=10)
+    check("malformed Build ID -> 400", r.status_code == 400)
+
+    # 13. debug cache is separate from the normal cache
+    r = post_build(client, P4)  # normal build of the same project
+    c, u, _ = counts(r)
+    check("normal build after split build compiles again (caches separate)",
+          r.status_code == 200 and (c, u) == (2, 0), f"compiled={c} reused={u}")
+    check("normal build has no Build ID header", "X-Build-Id" not in r.headers)
+    r = post_build(client, P4, split_symbols=True)
+    c, u, _ = counts(r)
+    check("split build still fully reused from debug cache", (c, u) == (0, 2),
+          f"compiled={c} reused={u}")
+
+    # 14. debug objects are keyed by the whole project
+    P4X = dict(P4)
+    P4X["unrelated.h"] = f"/* {nonce4} never included */\n"
+    r = post_build(client, P4X, split_symbols=True)
+    c, u, _ = counts(r)
+    check("split build: unreferenced file change recompiles all units",
+          r.status_code == 200 and (c, u) == (2, 0), f"compiled={c} reused={u}")
+    check("...but produces the same Build ID (same compile inputs)",
+          r.headers.get("X-Build-Id") == bid, r.headers.get("X-Build-Id", ""))
+    r = post_build(client, P4X)  # normal mode ignores the unreferenced file
+    c, u, _ = counts(r)
+    check("normal build: unreferenced file does not invalidate", (c, u) == (0, 2),
+          f"compiled={c} reused={u}")
+
+    # 15. concurrent identical split builds: one compile set, one symbol store
+    nonce5 = os.urandom(8).hex()
+    P5 = {
+        "main.c": (
+            f"/* {nonce5} */\n#include <stdio.h>\n#include \"s.h\"\n"
+            "int main(void){ printf(\"%d\\n\", s_val()); return 0; }\n"
+        ),
+        "s.c": f"/* {nonce5} */\n#include \"s.h\"\nint s_val(void){{ return S_VAL; }}\n",
+        "s.h": f"/* {nonce5} */\n#ifndef S_H\n#define S_H\n#define S_VAL 9\nint s_val(void);\n#endif\n",
+    }
+    s_before = client.get("/stats", timeout=10).json()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda _: post_build(client, P5, split_symbols=True), range(8)))
+    s_after = client.get("/stats", timeout=10).json()
+    bids = {r.headers.get("X-Build-Id") for r in responses}
+    check("8 concurrent split builds all succeed",
+          all(r.status_code == 200 for r in responses))
+    check("8 concurrent split builds agree on one Build ID", len(bids) == 1, str(bids))
+    check("concurrent split: each unit compiled exactly once globally",
+          sum(int(r.headers["X-Compiled-Count"]) for r in responses) == 2)
+    stored_delta = s_after["symbols_stored_total"] - s_before["symbols_stored_total"]
+    conflict_delta = s_after["symbols_conflicts_total"] - s_before["symbols_conflicts_total"]
+    check("concurrent split: symbols stored exactly once, no conflicts",
+          stored_delta == 1 and conflict_delta == 0,
+          f"stored_delta={stored_delta} conflict_delta={conflict_delta}")
+
     stats1 = client.get("/stats", timeout=10).json()
+    check("stats expose debug cache and symbol counters",
+          {"cached_debug_objects", "symbols_on_disk", "symbols_stored_total",
+           "symbols_reused_total", "symbols_conflicts_total"} <= set(stats1))
     print("\nstats before:", stats0)
     print("stats after: ", stats1)
 

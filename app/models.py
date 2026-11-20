@@ -48,6 +48,15 @@ class BuildRequest(BaseModel):
         default="app", pattern=r"^[A-Za-z0-9_.-]{1,64}$",
         description="Download filename for the built executable",
     )
+    split_symbols: bool = Field(
+        default=False,
+        description=(
+            "Split-symbols mode: compile with -g, strip the debug info out of "
+            "the returned program (its ELF Build ID is kept, see the "
+            "X-Build-Id response header) and store the matching symbol file "
+            "under that Build ID; download it via GET /symbols/{build_id}."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -59,14 +68,23 @@ class BuildRequest(BaseModel):
                         {"path": "util.c", "content": _EXAMPLE_UTIL_C},
                         {"path": "util.h", "content": _EXAMPLE_UTIL_H},
                     ],
-                }
+                },
+                {
+                    "output": "app",
+                    "split_symbols": True,
+                    "files": [
+                        {"path": "main.c", "content": _EXAMPLE_MAIN},
+                        {"path": "util.c", "content": _EXAMPLE_UTIL_C},
+                        {"path": "util.h", "content": _EXAMPLE_UTIL_H},
+                    ],
+                },
             ]
         }
     }
 
 
 class ErrorDetail(BaseModel):
-    stage: str = Field(description="validation | compile | link")
+    stage: str = Field(description="validation | compile | link | symbols")
     message: str
     unit: str | None = Field(default=None, description="Source file that failed, if any")
     diagnostics: str = Field(description="GCC stderr or validation message")
